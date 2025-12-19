@@ -51,6 +51,8 @@ public:
   std::map<size_t, Road>                  roads;
   std::map<size_t, std::shared_ptr<Lane>> lanes;
 
+  std::vector<std::shared_ptr<Lane>> get_neighbour_lanes( size_t lane_id ) const;
+
   double get_lane_speed_limit( size_t lane_id ) const;
 
   template<typename CenterPoint>
@@ -90,7 +92,7 @@ public:
       {
 
         // Deep copy the Lane
-        std::shared_ptr<Lane> copied_lane = std::make_shared<Lane>( *it->second );
+        std::shared_ptr<Lane> copied_lane = it->second;
         submap.lanes[lane_id]             = copied_lane;
 
         // Insert all MapPoints from the lane's borders into the submap's quadtree
@@ -100,7 +102,6 @@ public:
         {
           submap.quadtree.insert( point );
         }
-
 
         // Copy associated roads
         auto road_it = this->roads.find( it->second->road_id );
@@ -113,12 +114,15 @@ public:
             // Clear the lanes in the copied road and add the copied lane
             copied_road.lanes.clear();
             copied_road.lanes.insert( copied_lane );
-            submap.roads[road_it->first] = copied_road;
+            copied_road.lane_offset_to_lane.clear();
+            copied_road.lane_offset_to_lane[copied_lane->lateral_offset] = copied_lane;
+            submap.roads[road_it->first]                                 = copied_road;
           }
           else
           {
             // Add the lane to the existing road in the submap
             submap.roads[road_it->first].lanes.insert( copied_lane );
+            submap.roads[road_it->first].lane_offset_to_lane[copied_lane->lateral_offset] = copied_lane;
           }
         }
       }

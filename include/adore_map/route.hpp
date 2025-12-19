@@ -63,7 +63,7 @@ struct Route
   Route( const StartPoint& start_point, const EndPoint& end, const std::shared_ptr<Map>& reference_map );
 
   template<typename State>
-  double get_s( const State& state ) const;
+  std::optional<double> get_s( const State& state, double max_route_distance = std::numeric_limits<double>::infinity() ) const;
 
   template<typename TPoint>
   TPoint interpolate_at_s( double distance ) const;
@@ -110,34 +110,29 @@ Route::Route( const StartPoint& start_point, const EndPoint& end, const std::sha
 
 // get distance to object along route and if the object is within the lane
 template<typename State>
-double
-Route::get_s( const State& state ) const
+std::optional<double>
+Route::get_s( const State& state, double max_route_distance ) const
 {
-  if( !map ) // no map => we cannot proceed
-  {
-    std::cerr << "route needs map!" << std::endl;
-    return std::numeric_limits<double>::infinity();
-  }
+  if( !map )
+    return std::nullopt;
 
   double min_dist = std::numeric_limits<double>::max();
   auto   nearest  = map->quadtree.get_nearest_point( state, min_dist, [&]( const MapPoint& p ) {
-    // Return true only if p's lane_id is in our route_lane_ids
     return ( lane_to_sections.find( p.parent_id ) != lane_to_sections.end() );
   } );
 
-  // If we didn't find any point that meets the filter
   if( !nearest )
-  {
-    std::cerr << "no nearest     state x " << state.x << " y " << state.y << std::endl;
-    return std::numeric_limits<double>::infinity();
-  }
+    return std::nullopt;
 
   auto near_sec = lane_to_sections.at( nearest->parent_id );
 
-  double dist_along_sec = near_sec->start_s < near_sec->end_s ? ( nearest->s - near_sec->start_s ) : near_sec->start_s - nearest->s;
+  const double dist_along_sec = ( near_sec->start_s < near_sec->end_s ) ? ( nearest->s - near_sec->start_s )
+                                                                        : ( near_sec->start_s - nearest->s );
 
-  double route_distance = near_sec->route_s + dist_along_sec;
-  return refine_s_with_arc( *nearest, route_distance );
+  const double coarse_route_s = near_sec->route_s + dist_along_sec;
+
+  const double refined = refine_s_with_arc( state, coarse_route_s );
+  return refined;
 }
 
 template<typename TPoint>
@@ -303,61 +298,65 @@ Route::refine_s_with_arc( const PLike& pos, double coarse_s ) const
   auto it_next = std::next( nearest );
   if( it_next == reference_line.end() )
     return coarse_s; // no p_next
-
   const MapPoint& p0 = it_prev->second;
   const MapPoint& p1 = nearest->second;
   const MapPoint& p2 = it_next->second;
 
   double p0_s = it_prev->first;
-  double p1_s = nearest->first;
   double p2_s = it_next->first;
 
-
-  /* 2.  fit circle through p0-p1-p2 (barycentric formula)              */
+  // 2. Linear fallback for collinear points
   double a = p0.x * ( p1.y - p2.y ) - p0.y * ( p1.x - p2.x ) + p1.x * p2.y - p2.x * p1.y;
-  if( std::fabs( a ) < 1e-6 )
-    a = 1e-6;
+  if( std::fabs( a ) < 1e-4 )
+  {
+    // Use standard linear scalar projection: (A·B / |A|^2)
+    double dx     = p2.x - p0.x;
+    double dy     = p2.y - p0.y;
+    double sq_mag = dx * dx + dy * dy;
+    if( sq_mag < 1e-9 )
+      return coarse_s;
+    double u = ( ( pos.x - p0.x ) * dx + ( pos.y - p0.y ) * dy ) / sq_mag;
+    u        = std::clamp( u, 0.0, 1.0 );
+    return p0_s + u * ( p2_s - p0_s );
+  }
 
+  // 3. Circle fitting (Barycentric)
   const double sq0 = p0.x * p0.x + p0.y * p0.y;
   const double sq1 = p1.x * p1.x + p1.y * p1.y;
   const double sq2 = p2.x * p2.x + p2.y * p2.y;
+  const double cx  = ( sq0 * ( p2.y - p1.y ) + sq1 * ( p0.y - p2.y ) + sq2 * ( p1.y - p0.y ) ) / ( 2.0 * a );
+  const double cy  = ( sq0 * ( p1.x - p2.x ) + sq1 * ( p2.x - p0.x ) + sq2 * ( p0.x - p1.x ) ) / ( 2.0 * a );
+  const double r   = std::hypot( p1.x - cx, p1.y - cy );
 
-  const double cx = ( sq0 * ( p2.y - p1.y ) + sq1 * ( p0.y - p2.y ) + sq2 * ( p1.y - p0.y ) ) / ( 2.0 * a );
-  const double cy = ( sq0 * ( p1.x - p2.x ) + sq1 * ( p2.x - p0.x ) + sq2 * ( p0.x - p1.x ) ) / ( 2.0 * a );
-  const double r  = std::hypot( p1.x - cx, p1.y - cy );
+  // 4. Projection
+  const double dx             = pos.x - cx;
+  const double dy             = pos.y - cy;
+  const double dist_to_center = std::hypot( dx, dy );
+  if( dist_to_center < 1e-4 )
+    return coarse_s;
 
-  /* 3.  radial projection of ego position onto the circle              */
-  const double dx = pos.x - cx;
-  const double dy = pos.y - cy;
-  const double n2 = dx * dx + dy * dy;
-  if( n2 < 1e-9 )
-    return coarse_s; // at centre
+  // 5. Angular Calculation with wrap-around protection
+  auto   get_angle = [&]( double x, double y ) { return std::atan2( y - cy, x - cx ); };
+  double angle0    = get_angle( p0.x, p0.y );
+  double angle2    = get_angle( p2.x, p2.y );
+  double angleP    = get_angle( pos.x, pos.y );
 
-  const double k  = r / std::sqrt( n2 );
-  const double px = cx + k * dx;
-  const double py = cy + k * dy;
-
-  auto ang = [&]( double x, double y ) { return std::atan2( y - cy, x - cx ); };
-
-  const double a0 = ang( p0.x, p0.y );
-  const double a2 = ang( p2.x, p2.y );
-  const double ap = ang( px, py );
-
-  /* normalise signed angles to  |θ|≤π                                   */
-  auto norm = []( double a ) {
-    while( a > M_PI )
-      a -= 2 * M_PI;
-    while( a < -M_PI )
-      a += 2 * M_PI;
-    return a;
+  auto diff_angle = []( double end, double start ) {
+    double d = end - start;
+    while( d > M_PI )
+      d -= 2 * M_PI;
+    while( d < -M_PI )
+      d += 2 * M_PI;
+    return d;
   };
-  const double theta = norm( a2 - a0 );
-  const double phi   = norm( ap - a0 );
 
-  const bool inside_arc = ( theta >= 0.0 ) ? ( phi >= 0.0 && phi <= theta ) : ( phi <= 0.0 && phi >= theta );
+  double total_arc_angle = diff_angle( angle2, angle0 );
+  double point_arc_angle = diff_angle( angleP, angle0 );
 
-  /* 4.  convert angular offset to station                              */
-  const double ratio = ( std::fabs( theta ) < 1e-9 ) ? 0.0 : phi / theta; // 0…1 along p0→p2
+  // Clamp ratio to [0, 1] to prevent moving outside the p0-p2 segment
+  double ratio = point_arc_angle / total_arc_angle;
+  ratio        = std::clamp( ratio, 0.0, 1.0 );
+
   return p0_s + ratio * ( p2_s - p0_s );
 }
 

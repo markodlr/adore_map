@@ -14,6 +14,7 @@
 #pragma once
 #include <stdlib.h>
 
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -85,6 +86,7 @@ struct Lane
   LaneMaterial material;
   bool         left_of_reference = false;
   double       speed_limit       = 5.0; // Default to 5 m/s
+  double       lateral_offset    = 0.0; // deviation of center of lane from Road reference line in meters
 
   // Method to calculate the width of the lane at a given s coordinate
   double get_width( double s ) const;
@@ -97,7 +99,7 @@ struct Lane
 
   Lane() = default;
 
-  Lane( const Border& inner, const Border& outer, size_t id, size_t road_id, bool left_of_reference );
+  Lane( const Border& inner, const Border& outer, size_t id, size_t road_id, bool left_of_reference, double lateral_offset );
 
   double get_speed_limit() const;
 };
@@ -106,6 +108,7 @@ struct Road
 {
   std::string                               name;
   std::unordered_set<std::shared_ptr<Lane>> lanes;
+  std::map<double, std::shared_ptr<Lane>>   lane_offset_to_lane;
   bool                                      one_way = false;
   size_t                                    id;
   RoadCategory                              category;

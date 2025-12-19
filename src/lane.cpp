@@ -34,7 +34,7 @@ Lane::get_width( double s ) const
 
 // Set material based on string input
 void
-Lane::set_material( const std::string &material_str )
+Lane::set_material( const std::string& material_str )
 {
   static const std::unordered_map<std::string, LaneMaterial> material_map = {
     {    "asphalt",    LaneMaterial::asphalt },
@@ -59,7 +59,7 @@ Lane::set_material( const std::string &material_str )
 }
 
 void
-Lane::set_type( const std::string &type_str, const RoadCategory &road_category )
+Lane::set_type( const std::string& type_str, const RoadCategory& road_category )
 {
   static const std::unordered_map<std::string, LaneType> type_map = {
     {    "driving",    LaneType::driving },
@@ -135,10 +135,11 @@ Lane::set_type( const std::string &type_str, const RoadCategory &road_category )
   }
 }
 
-Lane::Lane( const Border &left, const Border &right, size_t id_, size_t road_id_, bool left_of_reference_ )
+Lane::Lane( const Border& left, const Border& right, size_t id_, size_t road_id_, bool left_of_reference_, double lateral_offset_ )
 {
   Borders lane_borders;
   left_of_reference = left_of_reference_;
+  lateral_offset    = lateral_offset_;
 
   lane_borders.inner = left_of_reference ? right : left;
   lane_borders.outer = left_of_reference ? left : right;
@@ -163,7 +164,7 @@ Lane::get_speed_limit() const
 }
 
 void
-Road::set_category( const std::string &road_category_str )
+Road::set_category( const std::string& road_category_str )
 {
   static const std::unordered_map<std::string, RoadCategory> category_map = {
     {    "unknown",    RoadCategory::unknown },

@@ -357,7 +357,7 @@ Border::get_interpolated_point( double s ) const
       return interpolation_points.back();
 
     // Find the two interpolation_points between which s lies
-    for( size_t i = 1; i < interpolation_points.size(); ++i )
+    for( size_t i = 1; i < interpolation_points.size(); ++i ) // TODO replace with binary search
     {
       if( s < interpolation_points[i].s )
       {
@@ -442,43 +442,85 @@ interpolate_borders( Borders& borders, double spacing_s )
   borders.inner.initialize_spline();
   borders.outer.initialize_spline();
 
-  double inner_length = borders.inner.compute_length();
-  double outer_length = borders.outer.compute_length();
+  const double inner_length = borders.inner.compute_length(); // geometric
+  const double outer_length = borders.outer.compute_length(); // geometric
 
-  // Determine the number of samples based on the longer border
-  double max_length  = std::max( inner_length, outer_length );
-  size_t num_samples = static_cast<size_t>( max_length / spacing_s ) + 1;
+  // --- NEW: build an s-range in the *reference-aligned* s-domain ----------------
+  // We expect borders.*.points[*].s to be aligned already (via reparameterize_based_on_reference).
+  // Use the average start/end s across inner/outer to be robust to tiny numeric differences.
+  double s_start = 0.5 * ( borders.inner.points.front().s + borders.outer.points.front().s );
+  double s_end   = 0.5 * ( borders.inner.points.back().s + borders.outer.points.back().s );
 
+  // Ensure increasing s (some borders can be stored reversed)
+  if( s_end < s_start )
+    std::swap( s_start, s_end );
+
+  const double s_span = s_end - s_start;
+
+  // If s is degenerate (or spacing is invalid), fall back to old behavior (lane-local s)
+  if( !( spacing_s > 0.0 ) || s_span <= 1e-6 )
+  {
+    const double max_length  = std::max( inner_length, outer_length );
+    size_t       num_samples = static_cast<size_t>( max_length / std::max( spacing_s, 1e-3 ) ) + 1;
+    if( num_samples < 2 )
+      num_samples = 2;
+
+    std::vector<double> t_values( num_samples );
+    std::vector<double> s_inner_values( num_samples );
+    std::vector<double> s_outer_values( num_samples );
+    std::vector<double> s_values( num_samples );
+
+    for( size_t i = 0; i < num_samples; ++i )
+    {
+      t_values[i]       = static_cast<double>( i ) / static_cast<double>( num_samples - 1 );
+      s_inner_values[i] = t_values[i] * inner_length;
+      s_outer_values[i] = t_values[i] * outer_length;
+      s_values[i]       = t_values[i] * max_length;
+    }
+
+    borders.inner.interpolate_border( s_inner_values );
+    borders.outer.interpolate_border( s_outer_values );
+
+    for( size_t i = 0; i < num_samples; ++i )
+    {
+      borders.inner.interpolated_points[i].s = s_values[i];
+      borders.outer.interpolated_points[i].s = s_values[i];
+    }
+    return;
+  }
+
+  // --- NEW: choose sample count from reference s-span ---------------------------
+  size_t num_samples = static_cast<size_t>( s_span / spacing_s ) + 1;
   if( num_samples < 2 )
     num_samples = 2;
 
-  // Create normalized parameter t_values ranging from 0 to 1
   std::vector<double> t_values( num_samples );
+  std::vector<double> s_inner_values( num_samples ); // geometric-s for spline sampling
+  std::vector<double> s_outer_values( num_samples ); // geometric-s for spline sampling
+  std::vector<double> s_ref_values( num_samples );   // reference-aligned s to assign into MapPoints
+
   for( size_t i = 0; i < num_samples; ++i )
   {
-    t_values[i] = static_cast<double>( i ) / ( num_samples - 1 );
+    const double t = static_cast<double>( i ) / static_cast<double>( num_samples - 1 );
+    t_values[i]    = t;
+
+    // Geometry interpolation still uses geometric arc-length fractions.
+    s_inner_values[i] = t * inner_length;
+    s_outer_values[i] = t * outer_length;
+
+    // But the *stored* s is now reference-aligned and shared across lanes on the same road.
+    s_ref_values[i] = s_start + t * s_span;
   }
 
-  // Compute s values for inner and outer borders
-  std::vector<double> s_inner_values( num_samples );
-  std::vector<double> s_outer_values( num_samples );
-  std::vector<double> s_values( num_samples );
-  for( size_t i = 0; i < num_samples; ++i )
-  {
-    s_inner_values[i] = t_values[i] * inner_length;
-    s_outer_values[i] = t_values[i] * outer_length;
-    s_values[i]       = t_values[i] * max_length;
-  }
-
-  // Interpolate borders
+  // Interpolate borders (geometry)
   borders.inner.interpolate_border( s_inner_values );
   borders.outer.interpolate_border( s_outer_values );
 
-  // Assign the s values to the interpolated points
+  // Assign reference-aligned s to the interpolated points
   for( size_t i = 0; i < num_samples; ++i )
   {
-    borders.inner.interpolated_points[i].s = s_values[i];
-    borders.outer.interpolated_points[i].s = s_values[i];
+    borders.inner.interpolated_points[i].s = s_ref_values[i];
+    borders.outer.interpolated_points[i].s = s_ref_values[i];
   }
 }
 

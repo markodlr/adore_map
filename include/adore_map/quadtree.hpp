@@ -48,29 +48,42 @@ public:
       return !( range.x_min > x_max || range.x_max < x_min || range.y_min > y_max || range.y_max < y_min );
     }
 
-    // Calculate the shortest distance from a point to the boundary (used for pruning)
+    // Squared distance from a point to the rectangle (no sqrt)
+    template<typename QueryPoint>
+    double
+    squared_distance_to_point( const QueryPoint& point ) const
+    {
+      double dx = 0.0;
+      if( point.x < x_min )
+        dx = x_min - point.x;
+      else if( point.x > x_max )
+        dx = point.x - x_max;
+
+      double dy = 0.0;
+      if( point.y < y_min )
+        dy = y_min - point.y;
+      else if( point.y > y_max )
+        dy = point.y - y_max;
+
+      return dx * dx + dy * dy;
+    }
+
+    // Keep the old API if something else uses it
     template<typename QueryPoint>
     double
     distance_to_point( const QueryPoint& point ) const
     {
-      double dx = std::max( { x_min - point.x, 0.0, point.x - x_max } );
-      double dy = std::max( { y_min - point.y, 0.0, point.y - y_max } );
-      return std::sqrt( dx * dx + dy * dy );
+      return std::sqrt( squared_distance_to_point( point ) );
     }
 
-    // Check if this boundary intersects with a circle
     bool
     intersects_circle( double center_x, double center_y, double radius ) const
     {
-      // Compute the closest point on the rectangle to the circle's center
       double closest_x = std::clamp( center_x, x_min, x_max );
       double closest_y = std::clamp( center_y, y_min, y_max );
-
-      // Compute the distance from the circle's center to this closest point
-      double distance = std::hypot( closest_x - center_x, closest_y - center_y );
-
-      // If the distance is less than or equal to the radius, the circle intersects the boundary
-      return distance <= radius;
+      double dx        = closest_x - center_x;
+      double dy        = closest_y - center_y;
+      return dx * dx + dy * dy <= radius * radius;
     }
   };
 
@@ -164,69 +177,84 @@ public:
     }
   }
 
-  // Find the nearest point to the query point
-
+  // Internal implementation: works with squared distances only.
   template<typename QueryPoint>
   std::optional<Point>
-  get_nearest_point(
-    const QueryPoint& query_point, double& min_dist,
-    // default: accept all points
-    const std::function<bool( const Point& )>& filter = []( const Point& ) { return true; } ) const
+  get_nearest_point_impl( const QueryPoint&                          query_point,
+                          double&                                    min_dist2, // squared distance
+                          const std::function<bool( const Point& )>& filter ) const
   {
     std::optional<Point> nearest_point = std::nullopt;
 
-    // Check all points in this node
+    // 1) Check all points in this node
     for( const auto& point : points )
     {
-      // Skip any point that fails the user-supplied filter
       if( !filter( point ) )
-      {
         continue;
-      }
 
-      double dist = adore::math::distance_2d( point, query_point );
-      if( dist < min_dist )
+      const double d2 = adore::math::squared_distance_2d( point, query_point );
+      if( d2 < min_dist2 )
       {
-        min_dist      = dist;
+        min_dist2     = d2;
         nearest_point = point;
       }
     }
 
-    // Recursively check children if this node is subdivided
+    // 2) Recursively check children if subdivided
     if( divided )
     {
-      // Create a list of quadrants with their distances to the query point
-      std::vector<std::pair<double, const Quadtree*>> quadrants = {
-        { northwest->boundary.distance_to_point( query_point ), northwest.get() },
-        { northeast->boundary.distance_to_point( query_point ), northeast.get() },
-        { southwest->boundary.distance_to_point( query_point ), southwest.get() },
-        { southeast->boundary.distance_to_point( query_point ), southeast.get() }
+      struct ChildInfo
+      {
+        double                 dist2;
+        const Quadtree<Point>* node;
       };
 
-      // Sort quadrants by distance to the query point
-      std::sort( quadrants.begin(), quadrants.end(), []( const auto& a, const auto& b ) { return a.first < b.first; } );
+      ChildInfo children[4] = {
+        { northwest->boundary.squared_distance_to_point( query_point ), northwest.get() },
+        { northeast->boundary.squared_distance_to_point( query_point ), northeast.get() },
+        { southwest->boundary.squared_distance_to_point( query_point ), southwest.get() },
+        { southeast->boundary.squared_distance_to_point( query_point ), southeast.get() }
+      };
 
-      // Recursively search quadrants that might contain a closer point
-      for( const auto& [dist_to_boundary, quadrant] : quadrants )
+      std::sort( std::begin( children ), std::end( children ), []( const ChildInfo& a, const ChildInfo& b ) { return a.dist2 < b.dist2; } );
+
+      for( const auto& child : children )
       {
-        // If the quadrant boundary is still within the current min_dist, it might have a closer point
-        if( dist_to_boundary < min_dist )
+        if( child.dist2 >= min_dist2 )
         {
-          auto child_nearest = quadrant->get_nearest_point( query_point, min_dist, filter );
-          if( child_nearest )
-          {
-            nearest_point = child_nearest;
-          }
-        }
-        else
-        {
-          // Prune search if the quadrant is definitely farther than our current best
+          // This child cannot contain a closer point than current best
           break;
+        }
+
+        if( auto child_nearest = child.node->get_nearest_point_impl( query_point, min_dist2, filter ) )
+        {
+          nearest_point = child_nearest;
         }
       }
     }
 
     return nearest_point;
+  }
+
+  // Public API: same signature as before, works in true distance.
+  template<typename QueryPoint>
+  std::optional<Point>
+  get_nearest_point(
+    const QueryPoint&                          query_point,
+    double&                                    min_dist, // true distance (in/out)
+    const std::function<bool( const Point& )>& filter = []( const Point& ) { return true; } ) const
+  {
+    double min_dist2 = min_dist * min_dist;
+
+    auto nearest = get_nearest_point_impl( query_point, min_dist2, filter );
+
+    // If we never improved min_dist2, min_dist stays as given.
+    if( min_dist2 < min_dist * min_dist )
+    {
+      min_dist = std::sqrt( min_dist2 );
+    }
+
+    return nearest;
   }
 
   Boundary boundary;

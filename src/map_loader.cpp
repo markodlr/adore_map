@@ -117,9 +117,10 @@ void
 MapLoader::make_lane( const BorderWithOffset& left_border, const BorderWithOffset& right_border, Road& road, Map& map,
                       const std::unordered_map<int, std::shared_ptr<r2s::BorderDataR2SL>>& id_to_border )
 {
-  bool left_of_reference = left_border.lateral_offset < 0.0;
-  auto lane_ptr          = std::make_shared<Lane>( left_border.clipped_border, right_border.clipped_border, generate_lane_id(), road.id,
-                                                   left_of_reference );
+  bool   left_of_reference = left_border.lateral_offset > 0.0;
+  double lateral_offset    = ( left_border.lateral_offset + right_border.lateral_offset ) / 2.0;
+  auto   lane_ptr          = std::make_shared<Lane>( left_border.clipped_border, right_border.clipped_border, generate_lane_id(), road.id,
+                                                     left_of_reference, lateral_offset );
 
   int boundary_id = left_of_reference ? left_border.clipped_border.points.front().parent_id
                                       : right_border.clipped_border.points.front().parent_id;
@@ -133,6 +134,7 @@ MapLoader::make_lane( const BorderWithOffset& left_border, const BorderWithOffse
 
   map.lanes[lane_ptr->id] = lane_ptr;
   road.lanes.insert( lane_ptr );
+  road.lane_offset_to_lane[lane_ptr->lateral_offset] = lane_ptr;
 
   for( const auto& p : lane_ptr->borders.center.interpolated_points )
   {
@@ -220,7 +222,7 @@ MapLoader::get_clipped_borders( const std::vector<Border>& borders, const Border
     borders_with_offsets.push_back( { clipped_border, lateral_offset } );
   }
   std::sort( borders_with_offsets.begin(), borders_with_offsets.end(),
-             []( const BorderWithOffset& a, const BorderWithOffset& b ) { return a.lateral_offset < b.lateral_offset; } );
+             []( const BorderWithOffset& a, const BorderWithOffset& b ) { return a.lateral_offset > b.lateral_offset; } );
 
   return borders_with_offsets;
 }
@@ -228,31 +230,65 @@ MapLoader::get_clipped_borders( const std::vector<Border>& borders, const Border
 double
 MapLoader::compute_lateral_offset( const Border& reference_line, const MapPoint& target_point )
 {
-  // Compute direction vector of reference line at ref_point
-  MapPoint ref_point = reference_line.get_interpolated_point( ( reference_line.points.front().s + reference_line.points.back().s ) / 2.0 );
-  double   s         = ref_point.s;
-  const double delta_s        = 0.01;
-  MapPoint     ref_point_next = reference_line.get_interpolated_point( s + delta_s );
+  const auto& pts = reference_line.points;
+  if( pts.size() < 2 )
+    return 0.0;
 
-  double dx        = ref_point_next.x - ref_point.x;
-  double dy        = ref_point_next.y - ref_point.y;
-  double magnitude = std::hypot( dx, dy );
+  // Find closest point on the reference polyline (segment projection)
+  double best_dist_sq = std::numeric_limits<double>::infinity();
+  double best_px      = pts.front().x;
+  double best_py      = pts.front().y;
+  double best_tx      = 1.0;
+  double best_ty      = 0.0;
 
-  if( magnitude == 0.0 )
+  for( size_t i = 0; i + 1 < pts.size(); ++i )
   {
-    return 0.0; // Avoid division by zero
+    const double ax = pts[i].x;
+    const double ay = pts[i].y;
+    const double bx = pts[i + 1].x;
+    const double by = pts[i + 1].y;
+
+    const double tx         = bx - ax;
+    const double ty         = by - ay;
+    const double seg_len_sq = tx * tx + ty * ty;
+    if( seg_len_sq <= 1e-12 )
+      continue;
+
+    // Project target onto segment [A,B]
+    const double vx = target_point.x - ax;
+    const double vy = target_point.y - ay;
+    double       u  = ( vx * tx + vy * ty ) / seg_len_sq;
+    u               = std::clamp( u, 0.0, 1.0 );
+
+    const double px = ax + u * tx;
+    const double py = ay + u * ty;
+
+    const double dx      = target_point.x - px;
+    const double dy      = target_point.y - py;
+    const double dist_sq = dx * dx + dy * dy;
+
+    if( dist_sq < best_dist_sq )
+    {
+      best_dist_sq = dist_sq;
+      best_px      = px;
+      best_py      = py;
+      best_tx      = tx;
+      best_ty      = ty;
+    }
   }
 
-  // Normalized normal vector
-  double nx = -dy / magnitude;
-  double ny = dx / magnitude;
+  const double t_mag = std::hypot( best_tx, best_ty );
+  if( t_mag <= 1e-12 )
+    return 0.0;
 
-  // Vector from ref_point to target_point
-  double tx = target_point.x - ref_point.x;
-  double ty = target_point.y - ref_point.y;
+  // Signed distance: positive if target is LEFT of tangent direction.
+  // cross(t, v) / |t| where v = target - projection.
+  const double vx                   = target_point.x - best_px;
+  const double vy                   = target_point.y - best_py;
+  const double cross                = best_tx * vy - best_ty * vx;
+  const double signed_left_positive = cross / t_mag;
 
-  // Compute dot product (lateral offset)
-  return -( tx * nx + ty * ny );
+  return signed_left_positive;
 }
 
 RoadGraph
@@ -465,13 +501,14 @@ MapLoader::load_from_xodr_file( const std::string& filename, bool ignore_non_dri
         auto [inner_border, outer_border] = xodr_mesh_to_borders( lane_mesh, lane_id, lanesec_s );
 
         std::shared_ptr<Lane> adore_lane_ptr = std::make_shared<Lane>( inner_border, outer_border, lane_id_counter, adore_road.id,
-                                                                       lane.id > 0 );
+                                                                       lane.id > 0, lane.outer_border.get( 0.0 ) );
 
         adore_lane_ptr->set_type( lane.type, adore_road.category );
 
         lane_mapping[lane.key] = adore_lane_ptr->id;
 
         adore_road.lanes.insert( adore_lane_ptr );
+        adore_road.lane_offset_to_lane[adore_lane_ptr->lateral_offset] = adore_lane_ptr;
 
         // TODO set road/lane categories
 
